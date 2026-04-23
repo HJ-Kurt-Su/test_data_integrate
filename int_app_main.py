@@ -71,6 +71,10 @@ def process_uploaded_files(files):
         return None
 
 
+@st.cache_data
+def cached_process(files):
+    return process_uploaded_files(files)
+    
 # Example: Generating figure with final_data
 def plot_variability(data):
     fig = go.Figure()
@@ -117,7 +121,7 @@ if uploaded_files:
         st.success("Data consolidated successfully!")
 
         # Downloadable CSV file
-        csv = consolidated_data.to_csv(index=False)
+        csv = consolidated_data.to_csv(index=False).encode('utf-8-sig')
         st.download_button(label="Download Consolidated CSV File", data=csv, file_name="integrated_displacement_force_results.csv", mime="text/csv")
 
         # Plot 1: Displacement_avg vs Force_avg
