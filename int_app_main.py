@@ -2,156 +2,234 @@ import pandas as pd
 import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
+from functools import reduce
 import numpy as np
-from io import BytesIO
+from scipy.integrate import simpson
+import io
 
-# --- 1. 數據對齊與讀取功能 ---
+# --- Functions ---
 
-def read_and_resample(uploaded_files):
-    """讀取多個檔案並對齊到統一的時間軸"""
-    all_dfs = []
-    file_names = []
+def read_single_file(uploaded_file):
+    """Reads and formats a single file, adding a 'Source' column for identification."""
+    if uploaded_file.name.endswith(".xlsx"):
+        file_data = pd.ExcelFile(uploaded_file).parse(sheet_name=0).iloc[1:]
+    elif uploaded_file.name.endswith(".csv"):
+        try:
+            file_data = pd.read_csv(uploaded_file, encoding='utf-8', sep=None, engine='python').iloc[1:]
+        except UnicodeDecodeError:
+            uploaded_file.seek(0)
+            file_data = pd.read_csv(uploaded_file, encoding='latin1', sep=None, engine='python').iloc[1:]
+    else:
+        st.warning(f"Unsupported file type: {uploaded_file.name}")
+        return None
     
-    # 讀取原始數據
-    for uploaded_file in uploaded_files:
-        if uploaded_file.name.endswith(".xlsx"):
-            df = pd.read_excel(uploaded_file).iloc[1:]
-        else:
-            df = pd.read_csv(uploaded_file, encoding='utf-8-sig', sep=None, engine='python').iloc[1:]
-        
-        df.columns = ["Time_s", "Displacement_mm", "Force_kN"]
-        df = df.astype(float).sort_values("Time_s")
-        all_dfs.append(df)
-        file_names.append(uploaded_file.name)
-
-    # 定義統一的時間軸 (取所有檔案中最小的最大時間)
-    max_time = min([df["Time_s"].max() for df in all_dfs])
-    min_time = max([df["Time_s"].min() for df in all_dfs])
-    common_time = np.linspace(min_time, max_time, 500) # 統一取 500 個點
-
-    # 對每個檔案進行插值對齊
-    aligned_data = {"Time_s": common_time}
-    individual_processed = []
-
-    for i, df in enumerate(all_dfs):
-        interp_disp = np.interp(common_time, df["Time_s"], df["Displacement_mm"])
-        interp_force = np.interp(common_time, df["Time_s"], df["Force_kN"])
-        
-        aligned_data[f"Disp_{i}"] = interp_disp
-        aligned_data[f"Force_{i}"] = interp_force
-        
-        # 存回個別的 DF 方便後續計算
-        temp_df = pd.DataFrame({
-            "Time_s": common_time,
-            "Displacement_mm": interp_disp,
-            "Force_kN": interp_force,
-            "Source": file_names[i]
-        })
-        individual_processed.append(temp_df)
-
-    merged_df = pd.DataFrame(aligned_data)
-    return individual_processed, merged_df
-
-# --- 2. 統計與指標計算功能 ---
-
-def calculate_detailed_metrics(df, label):
-    """計算 AUC, Max Y, X at Max Y, AUC to Peak"""
-    x = df["Displacement_mm"].values
-    y = df["Force_kN"].values
+    file_data.columns = ["Time_s", "Displacement_mm", "Force_kN"]
+    df = file_data.astype(float)
     
-    # 全域面積
-    total_auc = np.trapz(y, x)
+    # 功能 0: 數據對齊 (歸零處理)
+    df["Displacement_mm"] = df["Displacement_mm"] - df["Displacement_mm"].iloc[0]
+    df["Force_kN"] = df["Force_kN"] - df["Force_kN"].iloc[0]
     
-    # 最大值與對應 X
+    df["Source"] = uploaded_file.name
+    return df
+
+def analyze_curve(df, x_col, y_col, label):
+    """功能 2-4: 計算曲線下面積與最大值特徵"""
+    # 確保數據按 X 排序以利積分
+    df_sorted = df.sort_values(by=x_col)
+    x = df_sorted[x_col].values
+    y = df_sorted[y_col].values
+    
+    # 2. 全曲線面積 (AUC)
+    total_auc = simpson(y=y, x=x)
+    
+    # 3. Y軸最大值及其對應 X
     idx_max = np.argmax(y)
-    max_y = y[idx_max]
-    x_at_max_y = x[idx_max]
+    y_max = y[idx_max]
+    x_at_y_max = x[idx_max]
     
-    # 到最大值的面積
-    auc_to_peak = np.trapz(y[:idx_max+1], x[:idx_max+1])
+    # 4. 到達 Y 最大值前的面積
+    auc_to_max = simpson(y=y[:idx_max+1], x=x[:idx_max+1])
     
     return {
-        "來源": label,
-        "總曲線下面積 (kN-mm)": round(total_auc, 4),
-        "最大力 (kN)": round(max_y, 4),
-        "最大力對應位移 (mm)": round(x_at_max_y, 4),
-        "峰值前曲線下面積 (kN-mm)": round(auc_to_peak, 4)
+        "Dataset": label,
+        "Total_AUC": total_auc,
+        "Max_Force_kN": y_max,
+        "Disp_at_Max_Force_mm": x_at_y_max,
+        "AUC_to_Max": auc_to_max
     }
 
-# --- 3. 介面與繪圖 ---
+def merge_data_frames(data_frames):
+    dfs_to_merge = []
+    for i, df in enumerate(data_frames):
+        # 僅保留數值欄位進行合併，並加上索引
+        temp_df = df[["Time_s", "Displacement_mm", "Force_kN"]].rename(columns={
+            "Displacement_mm": f"Displacement_mm_{i}",
+            "Force_kN": f"Force_kN_{i}"
+        })
+        dfs_to_merge.append(temp_df)
+    return reduce(lambda left, right: pd.merge(left, right, on='Time_s', how='inner'), dfs_to_merge)
 
-st.set_page_config(page_title="材料測試數據整合分析", layout="wide")
-st.title("🚀 進階數據整合與特性分析系統")
+def compute_statistics(merged_data):
+    disp_cols = merged_data.filter(like="Displacement_mm")
+    force_cols = merged_data.filter(like="Force_kN")
 
-uploaded_files = st.file_uploader("上傳測試數據 (CSV/XLSX)", type=["xlsx", "csv"], accept_multiple_files=True)
-
-if uploaded_files and len(uploaded_files) >= 2:
-    # A. 數據處理與對齊
-    individual_dfs, merged_df = read_and_resample(uploaded_files)
+    merged_data['Displacement_avg'] = disp_cols.mean(axis=1)
+    merged_data['Displacement_std'] = disp_cols.std(axis=1)
+    merged_data['Force_avg'] = force_cols.mean(axis=1)
+    merged_data['Force_std'] = force_cols.std(axis=1)
     
-    # 計算平均數據 (Consolidated)
-    disp_cols = [c for c in merged_df.columns if "Disp_" in c]
-    force_cols = [c for c in merged_df.columns if "Force_" in c]
+    # 用於後續分析的欄位
+    return merged_data
+
+def process_uploaded_files(files):
+    data_frames = []
+    analysis_results = []
+
+    for uploaded_file in files:
+        file_data = read_single_file(uploaded_file)
+        if file_data is not None:
+            data_frames.append(file_data)
+            # 功能 2-4: 個別檔案分析
+            analysis_results.append(analyze_curve(file_data, "Displacement_mm", "Force_kN", uploaded_file.name))
+
+    if len(data_frames) > 1:
+        merged_data = merge_data_frames(data_frames)
+        consolidated_data = compute_statistics(merged_data)
+        
+        # 功能 2-4: 綜合數據分析
+        avg_analysis = analyze_curve(consolidated_data, "Displacement_avg", "Force_avg", "Consolidated_Avg")
+        analysis_results.append(avg_analysis)
+        
+        # 功能 5: 轉化為結果 DataFrame
+        summary_df = pd.DataFrame(analysis_results)
+        
+        return consolidated_data, data_frames, summary_df
+    else:
+        st.warning("Please upload at least two files for merging!")
+        return None, None, None
+
+def plot_all_curves(data_frames, consolidated_data):
+    """功能 1: 繪製所有原始曲線與平均曲線於同一圖表"""
+    fig = go.Figure()
     
-    consolidated_df = pd.DataFrame({
-        "Time_s": merged_df["Time_s"],
-        "Displacement_mm": merged_df[disp_cols].mean(axis=1),
-        "Force_kN": merged_df[force_cols].mean(axis=1),
-        "Displacement_std": merged_df[disp_cols].std(axis=1),
-        "Force_std": merged_df[force_cols].std(axis=1)
-    })
-
-    # B. 建立分析指標表
-    summary_list = []
-    for df in individual_dfs:
-        summary_list.append(calculate_detailed_metrics(df, df["Source"].iloc[0]))
+    # 繪製各個 input 曲線
+    for df in data_frames:
+        fig.add_trace(go.Scatter(
+            x=df["Displacement_mm"], y=df["Force_kN"],
+            mode='lines', name=df["Source"].iloc[0],
+            line=dict(width=1), opacity=0.5
+        ))
     
-    # 加入最後一列 Consolidated 數據
-    summary_list.append(calculate_detailed_metrics(consolidated_df, "★ Consolidated_Average"))
-    summary_table = pd.DataFrame(summary_list)
+    # 繪製平均曲線
+    fig.add_trace(go.Scatter(
+        x=consolidated_data["Displacement_avg"], 
+        y=consolidated_data["Force_avg"],
+        mode='lines', name="Consolidated Average",
+        line=dict(color='black', width=3, dash='dash')
+    ))
+    
+    fig.update_layout(title="All Input Curves vs Consolidated Average", 
+                      xaxis_title="Displacement (mm)", yaxis_title="Force (kN)",
+                      template="plotly_white")
+    return fig
 
-    # C. 網頁呈現與 Tabs
-    tab1, tab2, tab3 = st.tabs(["📊 曲線對比圖", "📋 統計特徵摘要", "💾 數據編輯與下載"])
+# Example: Generating figure with final_data
+def plot_variability(data):
+    fig = go.Figure()
 
-    with tab1:
-        st.subheader("所有輸入檔案與平均曲線對照")
-        fig_all = go.Figure()
-        
-        # 繪製各個 input 曲線
-        for df in individual_dfs:
-            fig_all.add_trace(go.Scatter(x=df["Displacement_mm"], y=df["Force_kN"], 
-                                         mode='lines', name=df["Source"].iloc[0], 
-                                         line=dict(width=1), opacity=0.5))
-        
-        # 繪製平均曲線
-        fig_all.add_trace(go.Scatter(x=consolidated_df["Displacement_mm"], y=consolidated_df["Force_kN"], 
-                                     mode='lines', name="Average Result", 
-                                     line=dict(color='black', width=3, dash='dash')))
-        
-        fig_all.update_layout(xaxis_title="Displacement (mm)", yaxis_title="Force (kN)", template="plotly_white")
-        st.plotly_chart(fig_all, use_container_width=True)
+    # Add scatter plot with error bars for displacement and force variability
+    fig.add_trace(go.Scatter(
+        x=data['Displacement_avg'],
+        y=data['Force_avg'],
+        error_x=dict(
+            type='data',
+            array=data['Displacement_std'],
+            visible=True
+        ),
+        error_y=dict(
+            type='data',
+            array=data['Force_std'],
+            visible=True
+        ),
+        mode='markers',
+        name="Average with Variability",
+        marker=dict(color='orange', size=8)
+    ))
 
-    with tab2:
-        st.subheader("數據特徵統計表")
-        st.dataframe(summary_table, use_container_width=True)
-        
-        # 下載摘要表按鈕
-        csv_summary = summary_table.to_csv(index=False).encode('utf-8-sig')
-        st.download_button("下載統計摘要表 (CSV)", data=csv_summary, 
-                           file_name="summary_statistics.csv", mime="text/csv")
+    # Customize the layout
+    fig.update_layout(
+        title="Displacement vs Force with Variability",
+        xaxis_title="Displacement (mm)",
+        yaxis_title="Force (kN)",
+        legend_title="Legend",
+        template="plotly_white"
+    )
+    return fig
 
-    with tab3:
-        st.subheader("合併後的數據明細")
-        edited_df = st.data_editor(consolidated_df, use_container_width=True)
-        
-        # 下載合併後的完整數據 (使用 Excel 方案避免錯位)
-        buffer = BytesIO()
-        with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
-            edited_df.to_excel(writer, index=False, sheet_name='Result')
-        
-        st.download_button("下載整合數據 (Excel)", data=buffer.getvalue(), 
-                           file_name="consolidated_data.xlsx", 
-                           mime="application/vnd.ms-excel")
 
-else:
-    st.info("請上傳至少兩個檔案以進行對齊與統計分析。")
+def get_plotly_download_link(fig, file_name):
+    """將 Plotly 圖表轉換為可下載的 HTML 位元組流"""
+    buffer = io.StringIO()
+    fig.write_html(buffer, include_plotlyjs='cdn')
+    html_bytes = buffer.getvalue().encode()
+    
+    return html_bytes
+# --- Streamlit UI ---
+st.title("Advanced Displacement vs Force Analysis")
+
+uploaded_files = st.file_uploader("Upload files", type=["xlsx", "csv"], accept_multiple_files=True)
+
+if uploaded_files:
+    consolidated_data, individual_dfs, summary_df = process_uploaded_files(uploaded_files)
+    
+    if consolidated_data is not None:
+        st.success("Analysis Complete!")
+
+        # 功能 1: 呈現所有曲線圖
+        st.subheader("1. Combined Curves Visualization")
+        fig_all = plot_all_curves(individual_dfs, consolidated_data)
+        # st.plotly_chart(plot_all_curves(individual_dfs, consolidated_data))
+        st.plotly_chart(fig_all)
+    
+    # 新增下載按鈕 (Combined Curves)
+        st.download_button(
+            label="Download Combined Curves Plot (HTML)",
+            data=get_plotly_download_link(fig_all, "combined_curves.html"),
+            file_name="combined_curves.html",
+            mime="text/html",
+            key="download_all_curves"
+        )
+
+        # 功能 5: 呈現分析結果表格與下載按鈕
+        st.subheader("2. Key Performance Indicators (KPIs) Summary")
+        st.dataframe(summary_df)
+        
+        summary_csv = summary_df.to_csv(index=False).encode('utf-8-sig')
+        st.download_button(
+            label="Download Summary Report (CSV)",
+            data=summary_csv,
+            file_name="curve_analysis_summary.csv",
+            mime="text/csv"
+        )
+
+        # 保留原有的下載與統計圖表
+        st.subheader("3. Statistical Data")
+        csv_full = consolidated_data.to_csv(index=False).encode('utf-8-sig')
+        st.download_button("Download Full Consolidated Data", csv_full, "full_data.csv")
+        
+        # 顯示原本的 Variability Plot
+        # (這裡需確保 plot_variability 傳入的是包含平均值的 DataFrame)
+        # st.plotly_chart(plot_variability(consolidated_data))
+        st.subheader("3. Statistical Data & Variability")
+        fig_var = plot_variability(consolidated_data)
+        st.plotly_chart(fig_var)
+        
+        # 新增下載按鈕 (Variability Plot)
+        st.download_button(
+            label="Download Variability Plot (HTML)",
+            data=get_plotly_download_link(fig_var, "variability_plot.html"),
+            file_name="variability_plot.html",
+            mime="text/html",
+            key="download_variability"
+    )
